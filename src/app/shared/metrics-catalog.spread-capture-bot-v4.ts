@@ -16,6 +16,21 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           description:
             'Сколько живых денег (USD) свободно на торговом счету бота прямо сейчас — то, что не потрачено на открытые позиции и не нужно под уже выставленные ордера. Это не вся ценность счёта, а только «живые» деньги, готовые к новым покупкам. Число растёт, когда бот продаёт позиции, и падает, когда покупает новые.',
         }),
+        metric('collateral_balance', {
+          label: 'Collateral Balance',
+          color: MetricColor.Green600,
+          unit: 'money',
+          aggregation: 'last',
+          description:
+            'Сырой баланс USDC на счету прямо сейчас, до вычета allowance-cap (в отличие от free_cash, который уже учитывает и allowance, и то, что зарезервировано под открытые ордера). Используется для расчёта entry_price_ceiling_pts по CASH_PRICE_LADDER.',
+        }),
+        metric('entry_price_ceiling_pts', {
+          label: 'Entry Price Ceiling (pts)',
+          color: MetricColor.Lime600,
+          aggregation: 'last',
+          description:
+            'Текущий потолок цены входа в пунктах, вычисленный по лестнице CASH_PRICE_LADDER на основе collateral_balance — чем меньше свободных денег, тем ниже (строже) потолок, вплоть до полной блокировки новых покупок на нулевой ступени. Если лестница не настроена, всегда равен плоскому MAX_ENTRY_BID_PTS.',
+        }),
       ],
     },
     {
@@ -36,22 +51,31 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           aggregation: 'sum',
           integerValued: true,
           description:
-            'Сколько раз за эту минуту попытка обработать hot-batch, dust-sweep или обновить account-state полностью не смогла начаться — потому что не получилось загрузить базовые данные со счёта (открытые ордера, позиции) или книги заявок. Если это не ноль, в соответствующей попытке бот вообще не принимал никаких торговых решений — не «решил ничего не делать», а технически не смог даже попытаться. Разбивка по тому, какая именно попытка сорвалась — в reconcile_failures_hot_batch_reconcile, reconcile_failures_dust_sweep_reconcile и reconcile_failures_account_state_refresh. Этим отличается от cycle_errors, где попытки были, но часть из них не получилась.',
+            'Сколько раз за эту минуту попытка обработать round-robin чанк, dust-sweep или обновить account-state полностью не смогла начаться — потому что не получилось загрузить базовые данные со счёта (открытые ордера, позиции) или книги заявок. Если это не ноль, в соответствующей попытке бот вообще не принимал никаких торговых решений — не «решил ничего не делать», а технически не смог даже попытаться. Разбивка по тому, какая именно попытка сорвалась — в reconcile_failures_cycle_chunk, reconcile_failures_dust_sweep_reconcile и reconcile_failures_account_state_refresh. Этим отличается от cycle_errors, где попытки были, но часть из них не получилась.',
         }),
-        metric('reconcile_failures_hot_batch_reconcile', {
-          label: 'Reconcile Failures: Hot Batch',
+        metric('reconcile_failures_cycle_chunk', {
+          label: 'Reconcile Failures: Cycle Chunk',
           color: MetricColor.Red600,
           aggregation: 'sum',
           integerValued: true,
           description:
-            'Из reconcile_failures — сколько раз сорвалась попытка обработать событийный hot-batch (загрузка стаканов по набранному dirty-set и последующий reconcile).',
+            'Из reconcile_failures — сколько раз сорвалась попытка обработать один REST-чанк (≤500 токенов) циклического round-robin обхода всей вселенной (plans/44) — загрузка стаканов по чанку и последующий reconcile. До plans/44 называлась reconcile_failures_hot_batch_reconcile — тот же смысл (сорвался ли reconcile), сменился только триггер (событийный WS dirty-set → циклический REST-обход).',
+        }),
+        metric('trading_halted', {
+          label: 'Trading Halted',
+          color: MetricColor.Red600,
+          aggregation: 'last',
+          integerValued: true,
+          description:
+            'Глобальный стоп-гейт торговли: 1, если биржа недавно отвечала 503 или похожей ошибкой достаточно часто, чтобы бот приостановил все новые place/replace — 0 в норме. Пока активен, решения по покупке и продаже блокируются с причиной trading_halted (см. buy_blocked_trading_halted/sell_blocked_trading_halted). Снимается само по себе по истечении паузы.',
         }),
         metric('reconcile_failures_dust_sweep_reconcile', {
           label: 'Reconcile Failures: Dust Sweep',
           color: MetricColor.Red600,
           aggregation: 'sum',
           integerValued: true,
-          description: 'Из reconcile_failures — сколько раз сорвалась часовая попытка часового прохода dust-sweep (ликвидация мусорных остатков позиций).',
+          description:
+            'Из reconcile_failures — сколько раз сорвалась часовая попытка часового прохода dust-sweep (ликвидация мусорных остатков позиций).',
         }),
         metric('reconcile_failures_account_state_refresh', {
           label: 'Reconcile Failures: Account State',
@@ -76,18 +100,65 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           description:
             'Техническая отметка живости процесса — экспортёр метрик проставляет 1 в каждый минутный снепшот автоматически, для любой метрики этого сервиса, независимо от того, была ли реальная торговая активность. Подтверждает, что процесс жив и успешно сформировал снепшот за минуту; ничего не говорит о состоянии самой торговли.',
         }),
+        metric('ms_since_last_mutation', {
+          label: 'Time Since Last Mutation (ms)',
+          color: MetricColor.Amber600,
+          aggregation: 'last',
+          description:
+            'Сколько миллисекунд прошло с последнего реального изменения ордера на бирже (успешное выставление или отмена) — публикуется независимо от границ round-robin прохода, раз в 10 секунд (plans/44). Замена no_mutation_streak: там считались «циклы подряд без мутаций», что перестало иметь смысл, когда цикл стал переменной по длительности величиной — устойчиво растущее значение (часы) означает, что бот давно ничего не меняет на бирже, независимо от того, сколько проходов round-robin за это время успело завершиться.',
+        }),
       ],
     },
     {
       id: 'performance',
       label: 'Performance',
       metrics: [
-        metric('hot_batch_ms', {
-          label: 'Hot Batch Duration (ms)',
+        metric('cycle_duration_ms', {
+          label: 'Cycle Duration (ms)',
           color: MetricColor.Violet600,
           aggregation: 'avg',
           description:
-            'Сколько миллисекунд занял один событийный hot-batch — от загрузки стаканов по набранному dirty-set до исполнения всех торговых решений по нему. Это прямой аналог cycle_duration_ms из cycle-эпохи бота, но теперь на масштабе одного батча, а не фиксированного 60-секундного цикла (см. plans/32). Растущее значение указывает на замедление либо биржи, либо самого шага принятия решений.',
+            'Сколько миллисекунд занял один полный проход циклического round-robin обхода всей вселенной токенов (кандидаты ∪ свои открытые ордера ∪ инвентарь), от старта до последнего обработанного чанка (plans/44). В отличие от cycle-эпохи V3, длительность прохода теперь не привязана к фиксированному таймеру и может варьироваться от секунд до нескольких минут в зависимости от размера вселенной и того, сколько решений реально потребовало place/replace (упор в биржевой лимит 40/сек) — растущее значение само по себе не авария, а полезный прямой показатель «насколько устарела книга по какому-то токену прямо сейчас в худшем случае».',
+        }),
+        metric('cycle_chunk_ms_avg', {
+          label: 'Cycle Chunk Duration: Avg (ms)',
+          color: MetricColor.Violet600,
+          aggregation: 'avg',
+          description:
+            'Средняя длительность обработки одного REST-чанка (≤500 токенов, см. cycle_chunk_size_avg) round-robin обхода за эту минуту — от загрузки стаканов до исполнения решений по чанку (plans/44). Прямой аналог hot_batch_ms из событийной эпохи, но усредняется в процессе перед публикацией, а не публикуется сырым гейджем на каждый чанк — чанков в минуту может быть как один, так и несколько десятков, в зависимости от активности.',
+        }),
+        metric('cycle_chunk_ms_max', {
+          label: 'Cycle Chunk Duration: Max (ms)',
+          color: MetricColor.Violet400,
+          aggregation: 'max',
+          description:
+            'Самая долгая обработка одного REST-чанка round-robin обхода за эту минуту — худший случай рядом со средним cycle_chunk_ms_avg.',
+        }),
+        metric('cycle_chunk_books_ms_avg', {
+          label: 'Cycle Chunk Books Duration: Avg (ms)',
+          color: MetricColor.Violet600,
+          aggregation: 'avg',
+          description:
+            'Из cycle_chunk_ms_avg — сколько в среднем занял именно REST-запрос /books (загрузка стаканов) внутри обработки одного чанка за эту минуту. Вместе с cycle_chunk_reconcile_ms_avg показывает, на что уходит время: на сетевой запрос к бирже или на сам расчёт решений.',
+        }),
+        metric('cycle_chunk_books_ms_max', {
+          label: 'Cycle Chunk Books Duration: Max (ms)',
+          color: MetricColor.Violet400,
+          aggregation: 'max',
+          description: 'Самый долгий REST-запрос /books внутри обработки одного чанка за эту минуту.',
+        }),
+        metric('cycle_chunk_reconcile_ms_avg', {
+          label: 'Cycle Chunk Reconcile Duration: Avg (ms)',
+          color: MetricColor.Violet600,
+          aggregation: 'avg',
+          description:
+            'Из cycle_chunk_ms_avg — сколько в среднем заняло принятие и исполнение торговых решений (без учёта загрузки стаканов) по одному чанку за эту минуту. Растёт при реальном исполнении place/replace на бирже (ожидание в очереди лимитера), не только от самого расчёта.',
+        }),
+        metric('cycle_chunk_reconcile_ms_max', {
+          label: 'Cycle Chunk Reconcile Duration: Max (ms)',
+          color: MetricColor.Violet400,
+          aggregation: 'max',
+          description: 'Самое долгое исполнение решений по одному чанку за эту минуту.',
         }),
         metric('account_state_refresh_ms', {
           label: 'Account State Refresh Duration (ms)',
@@ -100,7 +171,8 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           label: 'Dust Sweep Duration (ms)',
           color: MetricColor.Violet600,
           aggregation: 'avg',
-          description: 'Сколько миллисекунд занял один часовой проход dust-sweep (ликвидация мусорных остатков позиций).',
+          description:
+            'Сколько миллисекунд занял один часовой проход dust-sweep (ликвидация мусорных остатков позиций).',
         }),
       ],
     },
@@ -108,21 +180,35 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
       id: 'event-layer',
       label: 'Event Layer Health',
       metrics: [
-        metric('hot_batches_total', {
-          label: 'Hot Batches',
+        metric('reconcile_cycles', {
+          label: 'Reconcile Cycles',
           color: MetricColor.Blue600,
           aggregation: 'sum',
           integerValued: true,
           description:
-            'Сколько раз за эту минуту событийный market-триггер набрал полный dirty-set токенов (обычно 500, см. hot_batch_size) и запустил их reconcile. Это прямой аналог reconcile_cycles из cycle-эпохи бота, но по факту рыночной активности, а не по фиксированному таймеру: тихий рынок вообще не порождает батчей.',
+            'Сколько полных проходов циклического round-robin обхода всей вселенной токенов бот успел завершить за эту минуту (plans/44) — от одного до многих, в зависимости от размера вселенной и того, сколько решений реально требовали место/replace на бирже. Тихая вселенная и маленький размер — несколько проходов в минуту; большая активная — может быть меньше одного (см. cycle_duration_ms). До plans/44 метрика была помечена как убранная («понятия цикла больше нет») — с возвратом на цикличный обход понятие вернулось, просто цикл теперь не привязан к фиксированному таймеру.',
         }),
-        metric('hot_batch_size', {
-          label: 'Hot Batch Size',
+        metric('cycle_chunks_total', {
+          label: 'Cycle Chunks',
           color: MetricColor.Blue600,
-          aggregation: 'last',
+          aggregation: 'sum',
           integerValued: true,
           description:
-            'Сколько токенов было в последнем обработанном hot-batch. Обычно равно BOOKS_CHUNK_SIZE (500); меньше — если в момент взвешенного выбора (см. plans/43) ожидающих токенов было меньше 500, а не из-за какого-либо предохранителя — начиная с plans/43 такого понятия в этом месте больше нет.',
+            'Сколько REST-чанков (≤500 токенов каждый, см. cycle_chunk_size_avg) round-robin обход обработал за эту минуту — прямой аналог hot_batches_total из событийной эпохи, но единица работы сменилась с событийного WS-батча на чанк циклического обхода (plans/44): теперь считается фиксированным числом на каждый полный проход (⌈размер_вселенной / 500⌉), а не по факту рыночной активности.',
+        }),
+        metric('cycle_chunk_size_avg', {
+          label: 'Cycle Chunk Size: Avg',
+          color: MetricColor.Blue600,
+          aggregation: 'avg',
+          description:
+            'Средний размер REST-чанка round-robin обхода за эту минуту. Обычно близко к BOOKS_CHUNK_SIZE (500) — меньше бывает у последнего, «хвостового» чанка прохода, когда остаток вселенной не набирает полные 500 токенов.',
+        }),
+        metric('cycle_chunk_size_max', {
+          label: 'Cycle Chunk Size: Max',
+          color: MetricColor.Blue400,
+          aggregation: 'max',
+          description:
+            'Самый большой REST-чанк round-robin обхода за эту минуту — на практике почти всегда 500 (BOOKS_CHUNK_SIZE).',
         }),
         metric('hot_batch_max_wait_fired_total', {
           label: 'Hot Batch Max-Wait Fired',
@@ -130,7 +216,8 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           aggregation: 'sum',
           integerValued: true,
           removed: true,
-          removedNote: 'Механизм HOT_BATCH_MAX_WAIT убран целиком (см. plans/43) — новый взвешенный выбор со старением гарантирует отсутствие голодания без отдельного предохранителя-таймера, заменять нечем',
+          removedNote:
+            'Механизм HOT_BATCH_MAX_WAIT убран целиком (см. plans/43) — новый взвешенный выбор со старением гарантирует отсутствие голодания без отдельного предохранителя-таймера, заменять нечем',
           description:
             'Сколько раз за эту минуту сработал предохранитель HOT_BATCH_MAX_WAIT — dirty-set не набрал полный размер батча вовремя, и накопленное отправили на reconcile неполным. На активном боевом аккаунте практически не должно срабатывать вообще (см. plans/31 component 2); частое ненулевое значение — сигнал, что universe заметно поредел.',
         }),
@@ -140,38 +227,10 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           aggregation: 'last',
           integerValued: true,
           removed: true,
-          removedNote: 'Теперь hot_batch_pending_tokens — тот же смысл (сколько токенов сейчас ожидает), но без канала/потолка HOT_BATCH_QUEUE_CAP, которых с plans/43 больше не существует',
+          removedNote:
+            'Теперь hot_batch_pending_tokens — тот же смысл (сколько токенов сейчас ожидает), но без канала/потолка HOT_BATCH_QUEUE_CAP, которых с plans/43 больше не существует',
           description:
-            'Сколько уже готовых, но ещё не взятых в обработку hot-batch\'ей стояло в очереди перед тем, как консьюмер забрал очередной (потолок — HOT_BATCH_QUEUE_CAP). Консьюмер строго однопоточный (см. plans/31 component 4) — устойчиво растущее значение означает, что WS-поток набирает батчи быстрее, чем бот успевает их отторговывать, и это уже реальный бэкпрешер на приём новых сообщений.',
-        }),
-        metric('hot_batch_pending_tokens', {
-          label: 'Hot Batch Pending Tokens',
-          color: MetricColor.Amber600,
-          aggregation: 'last',
-          integerValued: true,
-          description:
-            'Сколько токенов остались ожидать взвешенного выбора сразу после того, как консьюмер забрал очередной hot-batch (см. plans/43). Прямой аналог старого hot_batch_queue_depth, но это не глубина канала с потолком, а размер набора ожидания — устойчиво растущее значение всё так же означает, что WS-поток помечает токены грязными быстрее, чем однопоточный консьюмер успевает их отторговывать.',
-        }),
-        metric('hot_batch_oldest_pending_ms', {
-          label: 'Hot Batch Oldest Pending (ms)',
-          color: MetricColor.Amber600,
-          aggregation: 'max',
-          description:
-            'Сколько миллисекунд самый долгождущий из ещё не выбранных токенов уже ждёт своей очереди, на момент последнего hot-batch (см. plans/43). Это прямая проверка гарантии от голодания: линейное старение веса при взвешенном выборе должно держать это значение в единицах минут даже для самых редких токенов (по симуляции — не больше ~3-4 минут); устойчиво растущее значение — сигнал, что старение недостаточно агрессивно на текущем масштабе нагрузки.',
-        }),
-        metric('hot_batch_drawn_tickets_avg', {
-          label: 'Hot Batch Drawn Tickets (avg)',
-          color: MetricColor.Blue600,
-          aggregation: 'avg',
-          description:
-            'Средний счётчик "билетиков" (сигналов с последнего выбора) среди токенов, попавших в последний hot-batch (см. plans/43). Показывает, насколько "горячим" был отобранный батч — вместе с hot_batch_drawn_tickets_max позволяет на практике проверить, что логарифмическое затухание веса не даёт горстке самых шумных токенов забирать батчи почти полностью.',
-        }),
-        metric('hot_batch_drawn_tickets_max', {
-          label: 'Hot Batch Drawn Tickets (max)',
-          color: MetricColor.Blue600,
-          aggregation: 'max',
-          description:
-            'Наибольший счётчик "билетиков" среди токенов, попавших в последний hot-batch (см. plans/43) — какой самый шумный токен был отобран и насколько сильно он оторвался от остальных. Резко растущее значение при низком hot_batch_drawn_tickets_avg — типичная картина при работающем логарифмическом затухании: единичные очень активные токены не тянут среднее вверх.',
+            "Сколько уже готовых, но ещё не взятых в обработку hot-batch'ей стояло в очереди перед тем, как консьюмер забрал очередной (потолок — HOT_BATCH_QUEUE_CAP). Консьюмер строго однопоточный (см. plans/31 component 4) — устойчиво растущее значение означает, что WS-поток набирает батчи быстрее, чем бот успевает их отторговывать, и это уже реальный бэкпрешер на приём новых сообщений.",
         }),
         metric('account_state_refresh_total', {
           label: 'Account State Refreshes',
@@ -187,38 +246,15 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           aggregation: 'sum',
           integerValued: true,
           description:
-            'Сколько раз за эту минуту токен был поставлен на паузу из-за неподтверждённого исхода отмены/замены ордера (биржа не подтвердила отмену, транспортная ошибка) — реальное состояние заявки неизвестно, и бот временно перестаёт трогать этот токен в hot-batch до следующего полного обновления account-state. Раньше (до plans/31) этот случай не был виден вообще никак.',
-        }),
-        metric('ws_market_connected_total', {
-          label: 'Market WS Connected',
-          color: MetricColor.Cyan700,
-          aggregation: 'sum',
-          integerValued: true,
-          description:
-            'Сколько раз за эту минуту одно из WS-соединений market-канала (книги заявок, до 500 токенов на соединение) успешно подключилось — включая самый первый коннект и все последующие переподключения после разрыва.',
-        }),
-        metric('ws_market_dropped_total', {
-          label: 'Market WS Dropped',
-          color: MetricColor.Red600,
-          aggregation: 'sum',
-          integerValued: true,
-          description:
-            'Сколько раз за эту минуту одно из WS-соединений market-канала оборвалось. Бот переподключается сам с экспоненциальным backoff — единичные обрывы это нормально (сетевые сбои у самого Polymarket), устойчивый рост — повод посмотреть логи.',
-        }),
-        metric('ws_market_universe_rebuilds_total', {
-          label: 'Market WS Universe Rebuilds',
-          color: MetricColor.Cyan700,
-          aggregation: 'sum',
-          integerValued: true,
-          description:
-            'Сколько раз за эту минуту весь пул market WS-соединений был полностью пересобран из-за изменения желаемого множества токенов (кандидаты ∪ свои открытые ордера ∪ инвентарь). Текущая реализация всегда пересобирает пул целиком, а не точечно (см. plans/32 component 2, отложено) — устойчиво частые пересборки при активной торговле являются прямым обоснованием этой будущей доработки.',
+            'Сколько раз за эту минуту токен был поставлен на паузу из-за неподтверждённого исхода отмены/замены ордера (биржа не подтвердила отмену, транспортная ошибка) — реальное состояние заявки неизвестно, и бот временно перестаёт трогать этот токен в очередном round-robin проходе до следующего полного обновления account-state. Раньше (до plans/31) этот случай не был виден вообще никак.',
         }),
         metric('ws_user_connected_total', {
           label: 'User WS Connected',
           color: MetricColor.Cyan700,
           aggregation: 'sum',
           integerValued: true,
-          description: 'Сколько раз за эту минуту приватный user-канал (свои сделки/ордера) успешно подключился — включая первый коннект и переподключения после разрыва.',
+          description:
+            'Сколько раз за эту минуту приватный user-канал (свои сделки/ордера) успешно подключился — включая первый коннект и переподключения после разрыва.',
         }),
         metric('ws_user_dropped_total', {
           label: 'User WS Dropped',
@@ -228,7 +264,7 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           description:
             'Сколько раз за эту минуту приватный user-канал оборвался. Каждый разрыв сам по себе форсирует обновление account-state при переподключении (пропущенная во время разрыва сделка не реплеится) — см. account_state_refresh_total.',
         }),
-        metric('ws_user_terminal_trades_total', {
+        metric('ws_user_terminal_trade_total', {
           label: 'User WS Terminal Trades',
           color: MetricColor.Blue600,
           aggregation: 'sum',
@@ -241,14 +277,16 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           color: MetricColor.Blue600,
           aggregation: 'sum',
           integerValued: true,
-          description: 'Сколько раз за эту минуту прошёл часовой dust-sweep проход, у которого нашлись реальные кандидаты на ликвидацию (не срабатывает вообще, если мусорных остатков нет).',
+          description:
+            'Сколько раз за эту минуту прошёл часовой dust-sweep проход, у которого нашлись реальные кандидаты на ликвидацию (не срабатывает вообще, если мусорных остатков нет).',
         }),
         metric('dust_sweep_size', {
           label: 'Dust Sweep Size',
           color: MetricColor.Blue600,
           aggregation: 'last',
           integerValued: true,
-          description: 'Сколько токенов было в последнем обработанном dust-sweep проходе — реальных кандидатов на ликвидацию мусорного остатка, не весь инвентарь.',
+          description:
+            'Сколько токенов было в последнем обработанном dust-sweep проходе — реальных кандидатов на ликвидацию мусорного остатка, не весь инвентарь.',
         }),
       ],
     },
@@ -335,21 +373,21 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           aggregation: 'avg',
           integerValued: true,
           description:
-            'Сколько кандидатов уровня 1 в последнем обработанном hot-batch прошли живую проверку эффективного спреда — реальную разницу между ценой продажи и ценой покупки на том же стакане, что бот использует для размещения ордеров, а не наивный топ-бид/топ-аск. Событийная метрика: считается по токенам, которые реально попали в очередной hot-batch (см. plans/32), а не по всему пулу кандидатов разом — крупные пулы видны по накоплению значений за несколько батчей подряд.',
+            'Сколько кандидатов уровня 1 за последний полный проход циклического round-robin обхода (plans/44) прошли живую проверку эффективного спреда — реальную разницу между ценой продажи и ценой покупки на том же стакане, что бот использует для размещения ордеров, а не наивный топ-бид/топ-аск. До plans/44 считалось по одному событийному hot-batch (частичная, нерепрезентативная выборка); теперь — по всей вселенной токенов за проход целиком, публикуется одним гейджем по завершении прохода.',
         }),
         metric('candidates_stage2_effective_spread_avg_pts', {
           label: 'Effective Spread: Avg (pts)',
           color: MetricColor.Cyan600,
           aggregation: 'avg',
           description:
-            'Средний реальный (эффективный) спред в пунктах среди кандидатов уровня 1 в последнем обработанном hot-batch — диагностика, не влияет на торговые решения. Публикуется только когда есть хотя бы один кандидат с посчитанным спредом в этом батче. Помогает видеть, насколько в среднем рынки не дотягивают до порога входа.',
+            'Средний реальный (эффективный) спред в пунктах среди кандидатов уровня 1 за последний полный проход round-robin обхода — диагностика, не влияет на торговые решения. Публикуется только когда есть хотя бы один кандидат с посчитанным спредом в этом проходе. Помогает видеть, насколько в среднем рынки не дотягивают до порога входа.',
         }),
         metric('candidates_stage2_effective_spread_min_pts', {
           label: 'Effective Spread: Min (pts)',
           color: MetricColor.Cyan600,
           aggregation: 'avg',
           description:
-            'Минимальный реальный (эффективный) спред в пунктах среди кандидатов уровня 1 в последнем обработанном hot-batch — худший случай в этом батче, публикуется только когда есть хотя бы один кандидат с посчитанным спредом. Полезно, чтобы понять, насколько близко к порогу входа находятся самые слабые кандидаты.',
+            'Минимальный реальный (эффективный) спред в пунктах среди кандидатов уровня 1 за последний полный проход round-robin обхода — худший случай во всей вселенной за этот проход, публикуется только когда есть хотя бы один кандидат с посчитанным спредом. Полезно, чтобы понять, насколько близко к порогу входа находятся самые слабые кандидаты.',
         }),
         metric('legacy_positions', {
           label: 'Legacy Positions',
@@ -357,7 +395,7 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           aggregation: 'last',
           integerValued: true,
           description:
-            'Сколько рынков в последнем обработанном hot-batch больше НЕ входят в кандидаты уровня 1 (не проходят фильтры на новый вход), но у бота там либо открытая позиция, либо открытый ордер — и поэтому их всё равно нужно сопровождать, например выставить продажу, чтобы выйти из позиции. Это нормально и ожидаемо: бот не бросает уже купленное только потому, что рынок перестал быть «привлекательным» для новых покупок.',
+            'Сколько рынков за последний полный проход round-robin обхода (plans/44) больше НЕ входят в кандидаты уровня 1 (не проходят фильтры на новый вход), но у бота там либо открытая позиция, либо открытый ордер — и поэтому их всё равно нужно сопровождать, например выставить продажу, чтобы выйти из позиции. Это нормально и ожидаемо: бот не бросает уже купленное только потому, что рынок перестал быть «привлекательным» для новых покупок.',
         }),
         metric('books_missing', {
           label: 'Missing Books',
@@ -365,7 +403,7 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           aggregation: 'last',
           integerValued: true,
           description:
-            'Сколько рынков из последнего обработанного hot-batch не удалось получить «стакан» (книгу заявок — текущие цены покупки/продажи других участников). Без стакана бот физически не может принять решение по такому рынку — он просто пропускается в этом батче. Большое, но СТАБИЛЬНОЕ значение — это не авария (часть рынков в рабочем списке уже неактивна или малоликвидна); внимания заслуживает только резкий внезапный рост.',
+            'Сколько рынков за последний полный проход round-robin обхода не удалось получить «стакан» (книгу заявок — текущие цены покупки/продажи других участников). Без стакана бот физически не может принять решение по такому рынку — он просто пропускается в этом проходе. Большое, но СТАБИЛЬНОЕ значение — это не авария (часть рынков в рабочем списке уже неактивна или малоликвидна); внимания заслуживает только резкий внезапный рост.',
         }),
         metric('filtered_out', {
           label: 'Filtered Out',
@@ -380,14 +418,14 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           color: MetricColor.Cyan600,
           aggregation: 'last',
           description:
-            'Из последнего обработанного hot-batch: сколько купленных контрактов сейчас реально защищено живой заявкой на продажу (полностью или частично покрывает объём позиции). Не требует стакана и не стоит дополнительных REST-запросов — считается по уже загруженным данным об ордерах и позициях.',
+            'За последний полный проход round-robin обхода: сколько купленных контрактов сейчас реально защищено живой заявкой на продажу (полностью или частично покрывает объём позиции). Не требует стакана и не стоит дополнительных REST-запросов — считается по уже загруженным данным об ордерах и позициях.',
         }),
         metric('sell_coverage_uncovered_shares', {
           label: 'Sell Coverage: Uncovered (shares)',
           color: MetricColor.Amber600,
           aggregation: 'last',
           description:
-            'Из последнего обработанного hot-batch: сколько купленных контрактов сейчас НЕ покрыто живой заявкой на продажу — либо заявки нет вообще, либо её размер меньше объёма позиции. Устойчиво ненулевое значение стоит проверить — обычно это временное состояние сразу после покупки, до того как sell-заявка выставлена.',
+            'За последний полный проход round-robin обхода: сколько купленных контрактов сейчас НЕ покрыто живой заявкой на продажу — либо заявки нет вообще, либо её размер меньше объёма позиции. Устойчиво ненулевое значение стоит проверить — обычно это временное состояние сразу после покупки, до того как sell-заявка выставлена.',
         }),
       ],
     },
@@ -480,6 +518,49 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           integerValued: true,
           description:
             'Сколько именно заявок на продажу сейчас стоит открытыми на бирже. Каждая такая заявка защищает уже купленную ботом позицию — она выставлена, чтобы при подходящей цене продать то, что уже куплено.',
+        }),
+        metric('orders_buy_shares', {
+          label: 'Buy Orders: Shares',
+          color: MetricColor.Blue600,
+          aggregation: 'last',
+          description: 'Суммарный объём в контрактах по всем открытым заявкам на покупку прямо сейчас.',
+        }),
+        metric('orders_sell_shares', {
+          label: 'Sell Orders: Shares',
+          color: MetricColor.Blue600,
+          aggregation: 'last',
+          description: 'Суммарный объём в контрактах по всем открытым заявкам на продажу прямо сейчас.',
+        }),
+        metric('orders_buy_unique', {
+          label: 'Buy Orders: Unique Markets',
+          color: MetricColor.Blue400,
+          aggregation: 'last',
+          integerValued: true,
+          description:
+            'Сколько разных рынков сейчас покрыто хотя бы одной заявкой на покупку (без учёта дублей — см. orders_buy_duplicates).',
+        }),
+        metric('orders_sell_unique', {
+          label: 'Sell Orders: Unique Markets',
+          color: MetricColor.Blue400,
+          aggregation: 'last',
+          integerValued: true,
+          description:
+            'Сколько разных рынков сейчас покрыто хотя бы одной заявкой на продажу (без учёта дублей — см. orders_sell_duplicates).',
+        }),
+        metric('orders_buy_duplicates', {
+          label: 'Buy Orders: Duplicates',
+          color: MetricColor.Amber600,
+          aggregation: 'last',
+          integerValued: true,
+          description:
+            'Сколько лишних заявок на покупку сверх одной на рынок сейчас стоит открытыми (orders_buy минус orders_buy_unique) — не ошибка сама по себе, дубли ещё предстоит обнаружить и отменить (см. duplicate_orders_canceled), это просто текущий снэпшот их количества.',
+        }),
+        metric('orders_sell_duplicates', {
+          label: 'Sell Orders: Duplicates',
+          color: MetricColor.Amber600,
+          aggregation: 'last',
+          integerValued: true,
+          description: 'То же самое, что orders_buy_duplicates, но для заявок на продажу.',
         }),
         metric('trade_post', {
           label: 'Post Actions',
@@ -582,6 +663,14 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           integerValued: true,
           description:
             'Сколько разных рынков сейчас находятся в «чёрном списке» на покупку — это рынки, где биржа несколько раз подряд отказала в покупке из-за нехватки баланса, и бот временно перестал туда заходить, чтобы не тратить попытки впустую. Рынок убирается из списка автоматически, когда перестаёт быть проблемным. Это защитный механизм, а не показатель размера потерь.',
+        }),
+        metric('capital_preservation_active', {
+          label: 'Capital Preservation Active',
+          color: MetricColor.Orange600,
+          aggregation: 'last',
+          integerValued: true,
+          description:
+            'Флаг cash-floor guard: 1, если свободного баланса стало настолько мало, что бот аварийно снял все BUY-ордера и блокирует новые (см. buy_stop_capital_preservation) — 0 в норме. Снимается автоматически, как только баланс восстанавливается выше порога плюс буфер гистерезиса (CASH_LADDER_RESUME_BUFFER_USD).',
         }),
       ],
     },
@@ -985,7 +1074,8 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           aggregation: 'last',
           removed: true,
           removedNote: 'Замены нет — см. estimated_account_value',
-          description: 'Сколько реально можно было бы получить прямо сейчас, если бы бот продал все открытые позиции по текущим ценам в стакане.',
+          description:
+            'Сколько реально можно было бы получить прямо сейчас, если бы бот продал все открытые позиции по текущим ценам в стакане.',
         }),
         metric('open_positions_no_book_count', {
           label: 'Open Positions: No Book',
@@ -994,7 +1084,8 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           integerValued: true,
           removed: true,
           removedNote: 'Замены нет — см. estimated_account_value',
-          description: 'Сколько позиций остались без стакана заявок на покупку, необходимого для оценки estimated_open_positions_value.',
+          description:
+            'Сколько позиций остались без стакана заявок на покупку, необходимого для оценки estimated_open_positions_value.',
         }),
         metric('open_positions_empty_bid_count', {
           label: 'Open Positions: Empty Bid',
@@ -1022,14 +1113,6 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           removedNote: 'Замены нет — см. estimated_account_value',
           description: 'Сколько контрактов из купленных позиций не оценены в деньгах из-за нехватки стакана.',
         }),
-        metric('reconcile_cycles', {
-          label: 'Reconcile Cycles',
-          aggregation: 'avg',
-          integerValued: true,
-          removed: true,
-          removedNote: 'Понятия «цикл» больше нет (см. plans/32) — ближайший аналог hot_batches_total (Event Layer Health)',
-          description: 'Сколько reconcile-циклов бот успел завершить за эту минуту.',
-        }),
         metric('no_mutation_streak', {
           label: 'No-Mutation Streak',
           color: MetricColor.Amber600,
@@ -1037,7 +1120,7 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           integerValued: true,
           removed: true,
           removedNote:
-            'Замены нет (см. plans/32) — событийная архитектура не порождает батчей по тихим токенам вообще, поэтому «цикл без изменений» больше не имеет прежнего смысла',
+            'Теперь ms_since_last_mutation (Pulse, plans/44) — «число циклов без мутации» плохо определено, когда сам цикл (round-robin проход) стал переменной, непредсказуемой длины; время с последней реальной мутации в мс не зависит от границ прохода вообще',
           description: 'Сколько торговых циклов подряд бот не сделал ни одного реального изменения ордеров.',
         }),
         metric('reconcile_failures_fetch_account', {
@@ -1055,8 +1138,20 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           aggregation: 'sum',
           integerValued: true,
           removed: true,
-          removedNote: 'Теперь reconcile_failures_hot_batch_reconcile (и reconcile_failures_dust_sweep_reconcile для dust-sweep)',
+          removedNote:
+            'Теперь reconcile_failures_cycle_chunk (и reconcile_failures_dust_sweep_reconcile для dust-sweep)',
           description: 'Сколько раз цикл сорвался именно на шаге загрузки стаканов по рабочему списку.',
+        }),
+        metric('reconcile_failures_hot_batch_reconcile', {
+          label: 'Reconcile Failures: Hot Batch',
+          color: MetricColor.Red600,
+          aggregation: 'sum',
+          integerValued: true,
+          removed: true,
+          removedNote:
+            'Теперь reconcile_failures_cycle_chunk (Pulse, plans/44) — WS market-канал и hot-batch триггер убраны целиком, market-side reconcile идёт по циклическому REST round-robin',
+          description:
+            'Из reconcile_failures — сколько раз сорвалась попытка обработать событийный hot-batch (загрузка стаканов по набранному dirty-set и последующий reconcile).',
         }),
         metric('fetch_ms', {
           label: 'Fetch Duration (ms)',
@@ -1071,7 +1166,8 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           color: MetricColor.Violet600,
           aggregation: 'avg',
           removed: true,
-          removedNote: 'Теперь входит в hot_batch_ms (Performance) — событийная архитектура больше не разделяет books-фетч и reconcile на отдельные измеримые фазы одного цикла',
+          removedNote:
+            'Теперь cycle_chunk_books_ms_avg/_max (Performance, plans/44) — та же фаза (время на REST /books), но на масштабе одного round-robin чанка, а не всего цикла целиком',
           description: 'Сколько миллисекунд заняла загрузка стаканов по всем рынкам из рабочего списка.',
         }),
         metric('reconcile_ms', {
@@ -1079,16 +1175,108 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           color: MetricColor.Violet600,
           aggregation: 'avg',
           removed: true,
-          removedNote: 'Теперь входит в hot_batch_ms (Performance)',
+          removedNote:
+            'Теперь cycle_chunk_reconcile_ms_avg/_max (Performance, plans/44) — та же фаза, на масштабе одного round-robin чанка',
           description: 'Сколько миллисекунд заняло принятие и исполнение всех торговых решений в цикле.',
         }),
-        metric('cycle_duration_ms', {
-          label: 'Cycle Duration (ms)',
+        metric('hot_batch_ms', {
+          label: 'Hot Batch Duration (ms)',
           color: MetricColor.Violet600,
           aggregation: 'avg',
           removed: true,
-          removedNote: 'Теперь hot_batch_ms (Performance) — на масштабе одного hot-batch, а не фиксированного 60-секундного цикла',
-          description: 'Сколько миллисекунд занял весь торговый цикл целиком.',
+          removedNote:
+            'Теперь cycle_chunk_ms_avg/_max (Performance, plans/44) — WS market-канал и hot-batch триггер убраны целиком, та же метрика теперь на масштабе одного REST round-robin чанка',
+          description:
+            'Сколько миллисекунд занял один событийный hot-batch — от загрузки стаканов по набранному dirty-set до исполнения всех торговых решений по нему.',
+        }),
+        metric('hot_batches_total', {
+          label: 'Hot Batches',
+          color: MetricColor.Blue600,
+          aggregation: 'sum',
+          integerValued: true,
+          removed: true,
+          removedNote:
+            'Теперь cycle_chunks_total (Event Layer Health, plans/44) — единица работы сменилась с событийного WS-батча на REST-чанк циклического обхода',
+          description:
+            'Сколько раз за эту минуту событийный market-триггер набрал полный dirty-set токенов (обычно 500, см. hot_batch_size) и запустил их reconcile.',
+        }),
+        metric('hot_batch_size', {
+          label: 'Hot Batch Size',
+          color: MetricColor.Blue600,
+          aggregation: 'last',
+          integerValued: true,
+          removed: true,
+          removedNote:
+            'Теперь cycle_chunk_size_avg/_max (Event Layer Health, plans/44) — тот же смысл, но публикуется усреднённым avg/max за минуту, а не сырым гейджем на каждый батч',
+          description: 'Сколько токенов было в последнем обработанном hot-batch. Обычно равно BOOKS_CHUNK_SIZE (500).',
+        }),
+        metric('hot_batch_pending_tokens', {
+          label: 'Hot Batch Pending Tokens',
+          color: MetricColor.Amber600,
+          aggregation: 'last',
+          integerValued: true,
+          removed: true,
+          removedNote:
+            'Замены нет (plans/44) — round-robin обходит все токены каждый проход циклически, у него нет очереди/набора ожидания взвешенного выбора',
+          description:
+            'Сколько токенов остались ожидать взвешенного выбора сразу после того, как консьюмер забрал очередной hot-batch (см. plans/43).',
+        }),
+        metric('hot_batch_oldest_pending_ms', {
+          label: 'Hot Batch Oldest Pending (ms)',
+          color: MetricColor.Amber600,
+          aggregation: 'max',
+          removed: true,
+          removedNote: 'Замены нет, см. hot_batch_pending_tokens',
+          description:
+            'Сколько миллисекунд самый долгождущий из ещё не выбранных токенов уже ждёт своей очереди, на момент последнего hot-batch (см. plans/43).',
+        }),
+        metric('hot_batch_drawn_tickets_avg', {
+          label: 'Hot Batch Drawn Tickets (avg)',
+          color: MetricColor.Blue600,
+          aggregation: 'avg',
+          removed: true,
+          removedNote:
+            'Замены нет (plans/44) — взвешенный выбор с билетиками убран вместе с hot-batch триггером, round-robin обходит все токены с равным приоритетом',
+          description:
+            'Средний счётчик "билетиков" (сигналов с последнего выбора) среди токенов, попавших в последний hot-batch (см. plans/43).',
+        }),
+        metric('hot_batch_drawn_tickets_max', {
+          label: 'Hot Batch Drawn Tickets (max)',
+          color: MetricColor.Blue600,
+          aggregation: 'max',
+          removed: true,
+          removedNote: 'Замены нет, см. hot_batch_drawn_tickets_avg',
+          description: 'Наибольший счётчик "билетиков" среди токенов, попавших в последний hot-batch (см. plans/43).',
+        }),
+        metric('ws_market_connected_total', {
+          label: 'Market WS Connected',
+          color: MetricColor.Cyan700,
+          aggregation: 'sum',
+          integerValued: true,
+          removed: true,
+          removedNote:
+            'Замены нет (plans/44) — WS market-канал убран целиком, весь market-side reconcile идёт по циклическому REST round-robin обходу',
+          description:
+            'Сколько раз за эту минуту одно из WS-соединений market-канала (книги заявок, до 500 токенов на соединение) успешно подключилось.',
+        }),
+        metric('ws_market_dropped_total', {
+          label: 'Market WS Dropped',
+          color: MetricColor.Red600,
+          aggregation: 'sum',
+          integerValued: true,
+          removed: true,
+          removedNote: 'Замены нет, см. ws_market_connected_total',
+          description: 'Сколько раз за эту минуту одно из WS-соединений market-канала оборвалось.',
+        }),
+        metric('ws_market_universe_rebuilds_total', {
+          label: 'Market WS Universe Rebuilds',
+          color: MetricColor.Cyan700,
+          aggregation: 'sum',
+          integerValued: true,
+          removed: true,
+          removedNote: 'Замены нет, см. ws_market_connected_total',
+          description:
+            'Сколько раз за эту минуту весь пул market WS-соединений был полностью пересобран из-за изменения желаемого множества токенов.',
         }),
       ],
     },
@@ -1106,7 +1294,8 @@ export const SPREAD_CAPTURE_BOT_V4_METRICS_DEFINITION: MetricsServiceDefinition 
           label: 'Bot CPU Peak',
           color: MetricColor.Red500,
           aggregation: 'max',
-          description: 'Пиковая доля CPU сервера, которую занимал процесс бота в одном из 5-секундных замеров этой минуты.',
+          description:
+            'Пиковая доля CPU сервера, которую занимал процесс бота в одном из 5-секундных замеров этой минуты.',
         }),
         metric('process_rss_bytes', {
           label: 'Bot RSS',
