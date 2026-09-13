@@ -216,11 +216,25 @@ export class MetricsService {
 
   public clearCache(): void {
     this.resetAllState();
-    this.refreshHistory();
   }
 
+  // Resets every existing entry in place rather than buffers.clear() — a card already
+  // rendered on screen holds a computed() whose only dependency is that entry's
+  // pointsSignal instance (see regularCardLive/compositeCardLive in
+  // metrics-dashboard.ts). Discarding the Map entry would silently orphan that
+  // computed: entryFor() would hand out a brand-new signal to future callers, but the
+  // already-subscribed computed keeps pointing at the old, now-dead one and is never
+  // marked stale again, so the chart would keep showing pre-clear data forever (until
+  // the component itself is destroyed and recreated). Writing an empty snapshot through
+  // the SAME signal instance notifies that computed correctly.
   private resetAllState(): void {
-    this.buffers.clear();
+    for (const entry of this.buffers.values()) {
+      entry.buffer = new MetricRingBuffer(
+        METRICS_GRANULARITY_WINDOW_PERIODS[entry.granularity],
+        METRICS_GRANULARITY_STEP_SECONDS[entry.granularity],
+      );
+      entry.pointsSignal.set([]);
+    }
     this.knownServicesInternal.clear();
     this.knownServices$$.set(new Set());
     this.pendingPersistKeys.clear();
