@@ -63,14 +63,16 @@
             <v-rolling-number #headerValueElem
                               class="text-sm font-semibold leading-none text-right"
                               [style.min-width.px]="headerValueReservedWidthPx$$()"
-                              [textInput]="headerDisplayValue$$()" />
+                              [textInput]="headerDisplayValue$$()"
+                              [speedInput]="100" />
             <span v-panel>{{ ohlc }}</span>
           </v-tooltip>
         } @else {
           <v-rolling-number #headerValueElem
                             class="text-sm font-semibold leading-none text-right"
                             [style.min-width.px]="headerValueReservedWidthPx$$()"
-                            [textInput]="headerDisplayValue$$()" />
+                            [textInput]="headerDisplayValue$$()"
+                            [speedInput]="2000" />
         }
       </div>
     }
